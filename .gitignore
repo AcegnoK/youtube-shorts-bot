@@ -1,0 +1,9 @@
+.env
+__pycache__/
+uploads/
+data/
+venv/
+.idea/
+token.pickle
+client_secret.json
+*.log
