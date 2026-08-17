@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import socket
 import time
 from datetime import datetime
 from pathlib import Path
@@ -58,9 +59,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     if youtube_uploader.credentials_valid():
         await state.set_state(ShortForm.video)
-        await message.answer(
-            "Привет! Отправь вертикальное видео до 60 секунд для YouTube Shorts 🎬"
-        )
+        await message.answer("Привет! Отправь вертикальное видео до 60 секунд")
         return
 
     flow = youtube_uploader.build_auth_flow()
@@ -99,9 +98,7 @@ async def on_auth_code(message: Message, state: FSMContext) -> None:
         return
 
     await state.set_state(ShortForm.video)
-    await message.answer(
-        "✅ Авторизация успешна! Отправь вертикальное видео до 60 секунд 🎬"
-    )
+    await message.answer("Привет! Отправь вертикальное видео до 60 секунд")
 
 
 @router.message(ShortForm.video)
@@ -266,11 +263,23 @@ async def publish_job(
 
 
 async def main() -> None:
+    logging.info("bot.py started, main() entered")
+    lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        lock.bind(("127.0.0.1", 47583))
+        lock.listen(1)
+        logging.info("lock acquired")
+    except OSError:
+        logging.error("Бот уже запущен (порт 47583 занят). Завершение.")
+        return
+
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher()
     dp.include_router(router)
     scheduler.start()
+    logging.info("starting polling")
     await dp.start_polling(bot)
+    logging.info("polling stopped")
 
 
 if __name__ == "__main__":
