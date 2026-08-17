@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -13,8 +13,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from config import BOT_TOKEN, UPLOADS_DIR
+import instagram_uploader
+import tiktok_uploader
 import youtube_uploader
-from youtube_uploader import upload_short
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,10 +24,30 @@ scheduler = AsyncIOScheduler()
 
 TIME_FORMAT = "%Y-%m-%d %H:%M"
 
+PLATFORMS = {
+    "youtube": {"label": "YouTube", "uploader": youtube_uploader.upload_short},
+    "tiktok": {"label": "TikTok", "uploader": tiktok_uploader.upload_short},
+    "reels": {"label": "Instagram Reels", "uploader": instagram_uploader.upload_short},
+}
+
+
+def platforms_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for key, info in PLATFORMS.items():
+        mark = "✅" if key in selected else "☑️"
+        rows.append(
+            [InlineKeyboardButton(text=f"{mark} {info['label']}", callback_data=f"plat:{key}")]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="✅ Готово", callback_data="plat:done")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 class ShortForm(StatesGroup):
     auth_code = State()
     video = State()
+    platforms = State()
     title = State()
     description = State()
     publish_time = State()
@@ -106,8 +127,42 @@ async def on_video(message: Message, state: FSMContext) -> None:
     await message.bot.download_file(file.file_path, destination=dest)
 
     await state.update_data(video_path=str(dest))
-    await state.set_state(ShortForm.title)
-    await message.answer("Видео сохранено ✅ Теперь отправь заголовок видео.")
+    await state.set_state(ShortForm.platforms)
+    await state.update_data(selected_platforms=[])
+    await message.answer(
+        "Видео сохранено ✅ Куда выложить?",
+        reply_markup=platforms_keyboard([]),
+    )
+
+
+@router.callback_query(F.data.startswith("plat:"))
+async def on_platform_choice(
+    callback: types.CallbackQuery, state: FSMContext
+) -> None:
+    await callback.answer()
+    data = await state.get_data()
+    selected: list[str] = data.get("selected_platforms", [])
+
+    choice = callback.data.split(":", 1)[1]
+    if choice == "done":
+        if not selected:
+            await callback.message.answer("Выбери хотя бы одну платформу.")
+            return
+        await state.set_state(ShortForm.title)
+        await callback.message.answer(
+            "Отлично! Теперь отправь заголовок видео."
+        )
+        return
+
+    if choice in selected:
+        selected.remove(choice)
+    elif len(selected) < len(PLATFORMS):
+        selected.append(choice)
+
+    await state.update_data(selected_platforms=selected)
+    await callback.message.edit_reply_markup(
+        reply_markup=platforms_keyboard(selected)
+    )
 
 
 @router.message(ShortForm.title)
@@ -150,6 +205,11 @@ async def on_publish_time(message: Message, state: FSMContext) -> None:
         return
 
     data = await state.get_data()
+    selected: list[str] = data.get("selected_platforms", [])
+    if not selected:
+        await message.answer("Не выбрана платформа. Начни заново — /start")
+        return
+
     scheduler.add_job(
         publish_job,
         trigger=DateTrigger(run_date=publish_at),
@@ -159,38 +219,50 @@ async def on_publish_time(message: Message, state: FSMContext) -> None:
             data["video_path"],
             data["title"],
             data["description"],
+            selected,
         ],
         id=f"upload_{int(time.time())}",
     )
 
+    platform_labels = ", ".join(PLATFORMS[p]["label"] for p in selected)
     await state.clear()
     await message.answer(
         "✅ Видео запланировано на "
         f"{publish_at.strftime(TIME_FORMAT)}\n\n"
+        f"📱 Куда: {platform_labels}\n"
         f"🎬 {data['title']}\n"
         f"📝 {data['description']}"
     )
 
 
 async def publish_job(
-    bot: Bot, chat_id: int, video_path: str, title: str, description: str
+    bot: Bot, chat_id: int, video_path: str, title: str, description: str, platforms: list[str]
 ) -> None:
     logging.info("Публикую видео: %s", video_path)
-    try:
-        url = await asyncio.to_thread(upload_short, video_path, title, description)
-        Path(video_path).unlink(missing_ok=True)
-        logging.info("Опубликовано: %s", url)
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="▶️ Открыть на YouTube", url=url)]
-            ]
-        )
-        await bot.send_message(
-            chat_id, f"🎉 Видео опубликовано!\n{url}", reply_markup=keyboard
-        )
-    except Exception as exc:
-        logging.exception("Ошибка публикации: %s", exc)
-        await bot.send_message(chat_id, f"❌ Ошибка публикации: {exc}")
+    success_lines = []
+    fail_lines = []
+    buttons = []
+    for key in platforms:
+        label = PLATFORMS[key]["label"]
+        try:
+            uploader = PLATFORMS[key]["uploader"]
+            url = await asyncio.to_thread(uploader, video_path, title, description)
+            success_lines.append(f"✅ {label}: {url}")
+            buttons.append(
+                [InlineKeyboardButton(text=f"▶️ Открыть: {label}", url=url)]
+            )
+            logging.info("%s: %s", label, url)
+        except Exception as exc:
+            logging.exception("Ошибка в %s: %s", label, exc)
+            fail_lines.append(f"❌ {label}: {exc}")
+
+    Path(video_path).unlink(missing_ok=True)
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    message_text = "\n".join(success_lines + fail_lines) or "Ничего не опубликовано."
+    await bot.send_message(
+        chat_id, f"🎉 Результат публикации:\n{message_text}", reply_markup=keyboard
+    )
 
 
 async def main() -> None:
