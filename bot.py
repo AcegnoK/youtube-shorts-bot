@@ -16,6 +16,7 @@ from apscheduler.triggers.date import DateTrigger
 from config import BOT_TOKEN, UPLOADS_DIR
 import instagram_uploader
 import tiktok_uploader
+import upload_post_uploader
 import youtube_uploader
 
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,10 @@ PLATFORMS = {
     "youtube": {"label": "YouTube", "uploader": youtube_uploader.upload_short},
     "tiktok": {"label": "TikTok", "uploader": tiktok_uploader.upload_short},
     "reels": {"label": "Instagram Reels", "uploader": instagram_uploader.upload_short},
+    "upload_post": {
+        "label": "Upload-Post (все площадки)",
+        "uploader": upload_post_uploader.upload_short,
+    },
 }
 
 
