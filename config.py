@@ -22,4 +22,11 @@ UPLOAD_POST_API_KEY = os.getenv("UPLOAD_POST_API_KEY")
 UPLOAD_POST_USER = os.getenv("UPLOAD_POST_USER")
 UPLOAD_POST_PLATFORMS = os.getenv("UPLOAD_POST_PLATFORMS", "youtube,tiktok,instagram")
 
+PMP_ACCESS_TOKEN = os.getenv("PMP_ACCESS_TOKEN")
+PMP_PROJECT_ID = int(os.getenv("PMP_PROJECT_ID") or 0)
+PMP_ACCOUNT_IDS = [
+    int(x.strip()) for x in (os.getenv("PMP_ACCOUNT_IDS") or "").split(",") if x.strip()
+]
+PMP_TZ_OFFSET = os.getenv("PMP_TZ_OFFSET", "+03:00")
+
 os.makedirs(UPLOADS_DIR, exist_ok=True)

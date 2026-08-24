@@ -1,38 +1,65 @@
 import asyncio
 import logging
+import os
 import socket
 import time
 from datetime import datetime
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F, Router, types
-from aiogram.filters import CommandStart
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.exceptions import (
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 
 from config import BOT_TOKEN, UPLOADS_DIR
-import instagram_uploader
-import tiktok_uploader
-import upload_post_uploader
-import youtube_uploader
+import postmypost_uploader
 
 logging.basicConfig(level=logging.INFO)
 
 router = Router()
 scheduler = AsyncIOScheduler()
 
+
+class RetryMiddleware(BaseRequestMiddleware):
+    async def __call__(self, make_request, bot, method):
+        for attempt in range(15):
+            try:
+                return await make_request(bot, method)
+            except TelegramRetryAfter as exc:
+                logging.warning("retry_after: жду %ss", exc.retry_after)
+                await asyncio.sleep(exc.retry_after + 1)
+            except (TelegramServerError, TelegramNetworkError) as exc:
+                if attempt == 14:
+                    raise
+                wait = min(2 ** attempt, 30)
+                logging.warning(
+                    "%s — повтор %s/15 через %ss",
+                    type(exc).__name__, attempt + 1, wait,
+                )
+                await asyncio.sleep(wait)
+        return await make_request(bot, method)
+
 TIME_FORMAT = "%Y-%m-%d %H:%M"
 
 PLATFORMS = {
-    "youtube": {"label": "YouTube", "uploader": youtube_uploader.upload_short},
-    "tiktok": {"label": "TikTok", "uploader": tiktok_uploader.upload_short},
-    "reels": {"label": "Instagram Reels", "uploader": instagram_uploader.upload_short},
-    "upload_post": {
-        "label": "Upload-Post (все площадки)",
-        "uploader": upload_post_uploader.upload_short,
+    "postmypost": {
+        "label": "PostMyPost (все площадки)",
+        "uploader": postmypost_uploader.upload_short,
     },
 }
 
@@ -51,7 +78,6 @@ def platforms_keyboard(selected: list[str]) -> InlineKeyboardMarkup:
 
 
 class ShortForm(StatesGroup):
-    auth_code = State()
     video = State()
     platforms = State()
     title = State()
@@ -62,48 +88,24 @@ class ShortForm(StatesGroup):
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    if youtube_uploader.credentials_valid():
-        await state.set_state(ShortForm.video)
-        await message.answer("Привет! Отправь вертикальное видео до 60 секунд")
-        return
-
-    flow = youtube_uploader.build_auth_flow()
-    url = youtube_uploader.get_auth_url(flow)
-    await state.update_data(auth_flow=flow)
-    await state.set_state(ShortForm.auth_code)
-    await message.answer(
-        "Для публикации нужна авторизация YouTube.\n\n"
-        "1️⃣ Открой ссылку (можно на телефоне):\n"
-        f"{url}\n\n"
-        "2️⃣ Войди в аккаунт Google и разреши доступ.\n"
-        "3️⃣ Откроется страница с ошибкой localhost — это нормально. "
-        "Скопируй из адресной строки всё, что идёт после code=, и пришли сюда."
-    )
-
-
-@router.message(ShortForm.auth_code)
-async def on_auth_code(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    flow = data.get("auth_flow")
-    if flow is None:
-        await message.answer("Что-то пошло не так. Напиши /start.")
-        return
-
-    code = youtube_uploader.extract_code(message.text or "")
-    if not code:
-        await message.answer(
-            "Код пустой. Открой ссылку, разреши доступ и скопируй код из адресной строки."
-        )
-        return
-
-    try:
-        youtube_uploader.save_token_from_code(flow, code)
-    except Exception as exc:
-        await message.answer(f"Ошибка авторизации: {exc}\nПопробуй ещё раз — /start")
-        return
-
     await state.set_state(ShortForm.video)
     await message.answer("Привет! Отправь вертикальное видео до 60 секунд")
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("Действие отменено. Нажми /start, чтобы начать заново.")
+
+
+async def set_bot_commands(bot: Bot) -> None:
+    await bot.set_my_commands(
+        [
+            BotCommand(command="start", description="🚀 Начать — загрузить Shorts"),
+            BotCommand(command="cancel", description="❌ Отменить действие"),
+        ],
+        scope=BotCommandScopeDefault(),
+    )
 
 
 @router.message(ShortForm.video)
@@ -250,9 +252,10 @@ async def publish_job(
             uploader = PLATFORMS[key]["uploader"]
             url = await asyncio.to_thread(uploader, video_path, title, description)
             success_lines.append(f"✅ {label}: {url}")
-            buttons.append(
-                [InlineKeyboardButton(text=f"▶️ Открыть: {label}", url=url)]
-            )
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                buttons.append(
+                    [InlineKeyboardButton(text=f"▶️ Открыть: {label}", url=url)]
+                )
             logging.info("%s: %s", label, url)
         except Exception as exc:
             logging.exception("Ошибка в %s: %s", label, exc)
@@ -269,6 +272,18 @@ async def publish_job(
 
 async def main() -> None:
     logging.info("bot.py started, main() entered")
+    telegram_api_ip = os.getenv("TELEGRAM_API_IP")
+    if telegram_api_ip:
+        original_getaddrinfo = socket.getaddrinfo
+
+        def patched_getaddrinfo(host, *args, **kwargs):
+            if host == "api.telegram.org":
+                host = telegram_api_ip
+            return original_getaddrinfo(host, *args, **kwargs)
+
+        socket.getaddrinfo = patched_getaddrinfo
+        logging.info("api.telegram.org -> %s", telegram_api_ip)
+
     lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         lock.bind(("127.0.0.1", 47583))
@@ -279,11 +294,21 @@ async def main() -> None:
         return
 
     bot = Bot(token=BOT_TOKEN)
+    bot.session.middleware(RetryMiddleware())
     dp = Dispatcher()
     dp.include_router(router)
+    await set_bot_commands(bot)
     scheduler.start()
     logging.info("starting polling")
-    await dp.start_polling(bot)
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.error("polling error: %s; retry in 10s", exc)
+            await asyncio.sleep(10)
     logging.info("polling stopped")
 
 
